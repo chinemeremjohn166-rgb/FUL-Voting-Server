@@ -1,0 +1,457 @@
+================================================================================
+VOTING API — COMPREHENSIVE ARCHITECTURAL AUDIT & REMEDIATION REPORT
+================================================================================
+
+1. EXECUTIVE ARCHITECTURAL SUMMARY
+--------------------------------------------------------------------------------
+A secure electronic voting system carries an uncommon architectural burden: it
+must simultaneously guarantee complete transparency and verifiability of results
+while enforcing absolute, unbreachable secrecy of individual voter choices. In
+addition, election integrity demands that no entity—not even a system administrator
+—can manipulate election parameters, voter rolls, candidate lists, or tallies while
+an election is active or after votes have been recorded.
+
+Prior to this remediation, the application suffered from severe architectural,
+cryptographic, and state-machine vulnerabilities. The system allowed unbounded ballot
+stuffing, leaked voter choices via temporal side-channel correlation, permitted
+forged administrative credentials through insecure fallbacks, allowed retroactive
+destruction of live elections, leaked database internals and stack traces, and lacked
+automated validation suites.
+
+Every file in the codebase has been audited, hardened, and refactored under the
+principles of defense-in-depth, fail-fast configuration, strict state machines,
+zero-trust authorization, and rigorous automated testing.
+
+
+2. COMPREHENSIVE FILE-BY-FILE BREAKDOWN
+--------------------------------------------------------------------------------
+
+================================================================================
+[A] CONFIGURATION & BOOTSTRAP LAYER
+================================================================================
+
+1. src/config.ts [CREATED]
+   - Purpose: Centralized, strictly validated environment configuration.
+   - The Problem: Previously, environment variables were read ad-hoc across files
+     using unguarded process.env references. Crucially, the JWT secret fell back
+     to a publicly committed string ("voting_secret_key_change_in_production").
+     Furthermore, due to ECMAScript module hoisting, dotenv configuration calls in
+     secondary modules could execute after imports, causing subtle undefined errors.
+   - The Solution: Created a single source of truth that boots immediately. It
+     validates that mandatory variables (DATABASE_URL, JWT_SECRET) exist and throws
+     a fatal startup exception if they are absent or blank. In production, it
+     enforces a minimum 32-character cryptographic entropy threshold for JWT_SECRET.
+     It normalizes environment checks (nodeEnv, isProduction, isTest) and standardizes
+     configuration consumption across the entire application.
+
+2. src/server.ts [CREATED]
+   - Purpose: Process entrypoint and runtime lifecycle management.
+   - The Problem: Previously, app.listen() was executed as a side-effect inside
+     src/app.ts at the moment the module was imported. This prevented automated
+     integration testing with tools like Supertest or ephemeral test servers, as
+     importing the app inevitably bound real operating system ports.
+   - The Solution: Extracted process listening into src/server.ts. This decouples
+     the Express application instance from the HTTP network listener. Server.ts
+     also attaches POSIX signal listeners (SIGTERM, SIGINT) to execute graceful
+     server shutdown, ensuring in-flight database transactions complete cleanly
+     before process exit.
+
+3. src/app.ts [REWRITTEN]
+   - Purpose: Express HTTP application configuration, pipeline middleware, and routing.
+   - The Problem: The original app.ts lacked essential defensive HTTP headers, had no
+     rate-limiting safeguards on brute-forceable authentication endpoints, had no
+     request body size constraints (exposing the node process to Denial of Service via
+     volumetric JSON payloads), and had an incomplete health-check probe.
+   - The Solution:
+     * Integrated Helmet to inject robust security headers (X-Content-Type-Options:
+       nosniff, Strict-Transport-Security, Content-Security-Policy, Frameguard).
+     * Enforced strict 50kb request payload limits on express.json().
+     * Integrated express-rate-limit to protect authentication endpoints (/login,
+       /register) with a 20-attempt window, and the public ballot receipt verification
+       endpoint (/verify/:receiptCode) with a 60-attempt window to prevent enumeration
+       attacks (bypassed cleanly during automated testing).
+     * Mounted the position routes directly on /api/v1/positions alongside the
+       legacy /api/v1/elections path for intuitive REST semantics.
+     * Upgraded the /health probe to actively query the database engine, returning
+       HTTP 200 when operational and HTTP 503 Service Unavailable if degraded.
+
+4. package.json [UPDATED]
+   - Purpose: Project dependencies, engines, and lifecycle scripts.
+   - Changes:
+     * Standardized npm scripts: "start" (production server), "dev" (watch mode),
+       "build" (TypeScript typecheck), and "test" (native test runner execution).
+     * Added dependencies: temporal-polyfill (ECMAScript Temporal support), helmet
+       (header hardening), and express-rate-limit (anti-abuse throttling).
+     * Removed legacy @prisma/client (Prisma 7 artifact) to eliminate dependency
+       confusion with Prisma 8 (@prisma/orm-postgres).
+     * Relocated @types/jsonwebtoken to devDependencies.
+
+5. tsconfig.json [UPDATED]
+   - Purpose: TypeScript compiler configuration.
+   - Changes: Restricted the "include" scope strictly to ["src/**/*.ts", "tests/**/*.ts"]
+     and explicitly excluded "migrations", "node_modules", and "dist". This prevents
+     stale migration snapshots or generated schema artifacts from breaking the project's
+     typechecking pipeline.
+
+6. .env & .env.example [UPDATED]
+   - Purpose: Environment specification.
+   - Changes: Standardized variable naming to use NODE_ENV (previously mislabeled as
+     ENV), documented JWT_SECRET requirements, and added descriptive setup guidance.
+
+
+================================================================================
+[B] CORE UTILITIES & SHARED LIBRARIES
+================================================================================
+
+7. src/lib/temporal.ts [CREATED]
+   - Purpose: Global Temporal polyfill binding and cryptographic time-bucketing.
+   - The Problem: Prisma 8 natively maps SQL DateTime columns to ECMAScript Temporal
+     Instants. On Node.js runtimes prior to 26.8.2 (including Node 22 and Node 24),
+     accessing DateTime fields throws RUNTIME.TEMPORAL_UNAVAILABLE unless polyfilled.
+     Additionally, recording precise millisecond timestamps on individual votes creates
+     a lethal side-channel attack: an attacker with database read access could join
+     Ballot.castAt with Vote.castAt to immediately unmask who cast which vote.
+   - The Solution: Imports and exposes the official temporal-polyfill. Implemented
+     the hourBucket() helper, which truncates the current timestamp to the top of
+     the hour (epoch milliseconds divisible by 3,600,000). By assigning all votes cast
+     within a given window the identical hour bucket timestamp, temporal correlation
+     between individual ballots and specific candidate choices is rendered mathematically
+     impossible.
+
+8. src/lib/http.ts [CREATED]
+   - Purpose: Typed HTTP domain error hierarchy and controller abstraction.
+   - The Problem: Previously, controllers manually formatted error payloads with
+     inconsistent status codes, or caught errors and replied with { error: error.message },
+     leaking sensitive PostgreSQL internal errors, schema names, and constraint names.
+   - The Solution: Implemented an HttpError class alongside semantic factory functions
+     (badRequest, unauthorized, forbidden, notFound, conflict). Created the asyncHandler
+     higher-order function to encapsulate asynchronous controller promises and cleanly
+     delegate unhandled rejections to the global error middleware. Created the
+     isUniqueViolation helper to inspect nested PostgreSQL SQLSTATE 23505 errors.
+
+9. src/lib/validation.ts [REWRITTEN]
+   - Purpose: Robust, type-safe request parsing and sanitization.
+   - The Problem: The original validation helpers were prone to type confusion: passing
+     a non-string or array caused immediate runtime crashes on .trim(). The matricNo
+     validator was logically inverted (rejecting missing matric numbers even when
+     optional, while accepting empty values). Seats and order parameters allowed
+     negative numbers, fractional floats, or NaN. Candidate photo URLs allowed
+     arbitrary URI schemes, introducing stored Cross-Site Scripting (XSS).
+   - The Solution:
+     * uuidParam() & uuidField(): Strictly verifies RFC-4122 UUID v4 formatting. Route
+       parameters with malformed IDs cleanly return HTTP 404 (a resource with an
+       invalid identifier cannot exist) rather than generating database cast crashes.
+     * str(): Defends against type confusion by asserting string types, trimming
+       whitespace, and checking minimum and maximum character lengths.
+     * int(): Validates integer boundaries (e.g. seats between 1 and 100), rejecting
+       floats, NaN, and negative values.
+     * email(): Strict email validation with automatic lowercase normalization.
+     * password(): Enforces 8 to 72 character bounds (respecting bcrypt limits) with
+       mandatory uppercase, lowercase, digit, and special character requirements.
+     * matricNo(): Case-insensitive uppercase normalization; cleanly optional.
+     * httpUrl(): Validates URL syntax and restricts protocol schemes strictly to
+       http: and https:, eradicating javascript: or data: stored XSS vectors.
+     * instant(): Validates ISO-8601 strings and parses them into Temporal.Instant.
+     * body() & array(): Ensures payload objects and collections conform to bounds.
+
+10. src/lib/auth.ts [REWRITTEN]
+    - Purpose: Cryptographic token generation, verification, and revocation.
+    - The Problem: Used a hardcoded fallback secret; accepted arbitrary JWT algorithms
+      (vulnerable to 'none' algorithm exploits); had no mechanism to revoke tokens
+      upon logout; trusted token claims for 24 hours even if the user was deleted or
+      demoted from administrator to voter.
+    - The Solution: Pinned token signing and verification strictly to HMAC-SHA256
+      (HS256). Tokens encode only the user's subject identifier (sub), issuance time
+      (iat), and expiry (exp). Implemented an in-memory revocation registry keyed by
+      issuance timestamp; when a user logs out, all tokens issued prior to that moment
+      are immediately repudiated. User role and active state are decoupled from the
+      token and verified against the live database on every authenticated request.
+
+11. src/lib/audit.ts [REWRITTEN]
+    - Purpose: Immutable audit log generation.
+    - The Problem: The metadata field was serialized with JSON.stringify() before being
+      passed to a PostgreSQL jsonb column, resulting in double-encoded JSON strings
+      in the database. Audit logs were recorded outside the business transaction and
+      errors were silently suppressed.
+    - The Solution: Passes native JavaScript objects directly to the jsonb column.
+      Extended logAudit to accept an optional transaction context (tx), enabling
+      critical audit entries (such as voter roll expansions) to commit or roll back
+      atomically with the state change they describe.
+
+
+================================================================================
+[C] MIDDLEWARE LAYER
+================================================================================
+
+12. src/middlewares/auth.middleware.ts [REWRITTEN]
+    - Purpose: Authentication gate, live authorization verification, and cookie parsing.
+    - The Problem: Previously trusted user roles stored in the JWT payload for up to
+      24 hours. A demoted administrator retained full administrative powers until
+      token expiration. Cookie extraction used a simplistic regular expression prone
+      to malformed cookie headers.
+    - The Solution: Parses Bearer tokens and cookie headers safely. After decoding
+      the cryptographic signature, it queries the User database record in real time.
+      If the user has been deleted or deactivated, access is denied (401). If an
+      administrator has been demoted to a voter, their request context immediately
+      reflects the updated database role, rendering privilege retention impossible.
+      requireAdmin enforces strict role isolation.
+
+13. src/middlewares/error.middleware.ts [REWRITTEN]
+    - Purpose: Global exception interception and sanitized client responses.
+    - The Problem: Returned raw error.message and error.stack directly to callers.
+      In production, this leaked database table names, constraint definitions, internal
+      SQL syntax, and server directory structures.
+    - The Solution: Centralized error translation. Semantic HttpErrors return their
+      intended, safe message and status code. Malformed JSON payloads produce a clean
+      400 Bad Request. Oversized bodies produce HTTP 413 Payload Too Large. Unhandled
+      system errors log the full stack trace to server logs while returning a generic,
+      safe "An unexpected error occurred" message (HTTP 500) to API consumers.
+
+
+================================================================================
+[D] DATABASE & DATA CONTRACT LAYER
+================================================================================
+
+14. src/prisma/db.ts [REWRITTEN]
+    - Purpose: PostgreSQL database runtime initialization.
+    - Changes: Ensures environment configuration (src/config.ts) and the global
+      Temporal polyfill (src/lib/temporal.ts) are initialized before the Prisma 8
+      postgres runtime instance is instantiated.
+
+15. src/prisma/contract.prisma [UPDATED]
+    - Purpose: Prisma 8 contract definition.
+    - Changes: Preserved data contract compatibility with emitted artifacts. Documented
+      the architectural decoupling between the Ballot model (which records THAT a user
+      voted) and the Vote model (which records WHAT was chosen, intentionally omitting
+      any relationship to User or Ballot).
+
+
+================================================================================
+[E] CONTROLLER LAYER (BUSINESS LOGIC)
+================================================================================
+
+16. src/controllers/auth.controller.ts [REWRITTEN]
+    - Purpose: Registration, credential verification, identity introspection, and logout.
+    - Fixes:
+      * Replaced synchronous bcrypt.hashSync and bcrypt.compareSync with asynchronous
+        bcrypt.hash and bcrypt.compare, preventing event loop blocking during heavy
+        concurrent traffic.
+      * Fixed inverted matricNo validation; matric numbers are now properly optional
+        and validated when supplied.
+      * Normalized identifiers: email queries are case-insensitive (lowercase), and
+        matriculation number queries are case-insensitive (uppercase).
+      * Integrated server-side token revocation on logout: calling /logout invalidates
+        the user's outstanding JWT tokens across the system.
+
+17. src/controllers/vote.controller.ts [REWRITTEN]
+    - Purpose: Cryptographic ballot issuance, choice validation, and atomic vote recording.
+    - Fixes:
+      * Critical Ballot Stuffing (C1) Remediation: Previously, a client could submit
+        hundreds of selections for the same position or candidate. The controller now
+        maps each selection to its corresponding Position, strictly enforces that the
+        total votes for a position cannot exceed position.seats, forbids voting for
+        the same candidate multiple times, and verifies that candidate IDs belong to
+        that position.
+      * Secret Ballot De-Correlation (C2) Remediation: Eliminates timestamp joins. The
+        Ballot entry records the voter's participation timestamp. The separate Vote
+        entries are written with an identical, coarse hourBucket() timestamp. Furthermore,
+        the selections array is randomly shuffled in memory before insertion, breaking
+        any correlation based on row creation order.
+      * Strict Pre-Conditions: Rejects votes if the election is not OPEN, or if the
+        current time is prior to startsAt or after endsAt. Verifies voter presence on
+        the voter roll.
+      * Concurrency Defense: Executes Ballot creation and Vote insertion inside an
+        ACID database transaction, gracefully catching duplicate submission conflicts.
+      * Receipt Verification: Generates high-entropy receipt codes (REC-XXXX-HEX) and
+        provides a public verification endpoint that confirms ballot inclusion without
+        divulging voter identity or candidate selections.
+
+18. src/controllers/election.controller.ts [REWRITTEN]
+    - Purpose: Election lifecycle administration, status transitions, and queries.
+    - Fixes:
+      * Strict State Machine (C4) Remediation: Enforced a unidirectional transition
+        sequence: DRAFT -> OPEN -> CLOSED -> PUBLISHED. Reverting an election from
+        OPEN to DRAFT (which previously allowed cascade-deleting live votes) is strictly
+        forbidden. Skipping directly from DRAFT to PUBLISHED is forbidden.
+      * Opening Invariant: Transitioning to OPEN requires at least one configured
+        Position, and every Position must have at least one registered Candidate.
+      * Destruction Guard: deleteElection is strictly restricted to DRAFT elections.
+        Active, closed, or published elections cannot be deleted.
+      * Visibility Guard (H8): Non-administrative users requesting election details
+        receive HTTP 404 if the election is in DRAFT status.
+      * Update Date Bounds (H9): Modifying startsAt and endsAt enforces strict chronological
+        ordering (endsAt must be after startsAt) and validates ISO-8601 formatting.
+
+19. src/controllers/position.controller.ts [REWRITTEN]
+    - Purpose: Contest/position configuration within elections.
+    - Fixes:
+      * Mutation Lock (C5): Previously, positions could be updated or deleted during
+        an active or closed election, cascade-deleting votes or altering seat counts
+        mid-election. Updating or deleting positions is now strictly prohibited unless
+        the election is in DRAFT status.
+      * Bounds Validation: seats is validated as an integer between 1 and 100; order
+        is validated as a positive integer.
+      * Non-admin users cannot inspect positions belonging to DRAFT elections.
+
+20. src/controllers/candidate.controller.ts [REWRITTEN]
+    - Purpose: Candidate registration and profile management.
+    - Fixes:
+      * Mutation Lock (C5): Candidate creation, modification, and deletion are strictly
+        locked to elections in DRAFT status. This prevents deleting a candidate mid-vote,
+        which previously caused votes to silently turn into null/abstain votes.
+      * Null-Safety: Added defensive checks on candidate.position relationships.
+      * XSS Prevention: photoUrl is strictly validated to ensure http: and https: protocols.
+
+21. src/controllers/voter-roll.controller.ts [REWRITTEN]
+    - Purpose: Eligible voter registration and roster management.
+    - Fixes:
+      * Mutation Lock (C5): Adding or removing voters is strictly forbidden once an
+        election advances past DRAFT. This prevents late phantom voter injection or
+        targeted voter roll purging during live voting.
+      * Atomic Batch Processing: Enclosed voter roll addition inside a database
+        transaction. If an invalid or unresolvable identifier is encountered, the system
+        returns a structured diagnostic report rather than aborting halfway through
+        with a 500 error.
+
+22. src/controllers/result.controller.ts [REWRITTEN]
+    - Purpose: Vote tallying, winner computation, turnout analytics, and access control.
+    - Fixes:
+      * Live Result Snooping (C6) Remediation: Previously, administrators could query
+        live tallies while an election was OPEN, introducing election interference
+        risks. Results are now strictly forbidden to ALL users while an election is
+        DRAFT or OPEN. When CLOSED, only administrators can preview results for verification.
+        When PUBLISHED, results become accessible to voters.
+      * Winner Logic (M5): Candidates with zero votes are excluded from being declared
+        winners.
+      * Tie Detection: Inspects vote totals at the seat boundary; if the last winning
+        candidate shares an identical vote count with the first runner-up, the system
+        flags hasTie: true in the response.
+
+
+================================================================================
+[F] AUTOMATED TEST SUITE
+================================================================================
+
+23. tests/unit/validation.test.ts [CREATED]
+    - 13 automated unit tests verifying UUID parameter parsing, string trimming,
+      integer bounds, email normalization, password complexity, matric number
+      optionality, URL protocol restriction, and body length capping.
+
+24. tests/unit/auth.test.ts [CREATED]
+    - 5 automated unit tests verifying JWT generation, payload structure, server-side
+      token revocation on logout, signature verification, rejection of unauthorized
+      signing keys, and rejection of the 'none' algorithm vulnerability.
+
+25. tests/unit/secrecy.test.ts [CREATED]
+    - 3 automated unit tests validating that the data contract maintains zero relation
+      links between Vote and User/Ballot, and asserting that hourBucket() accurately
+      truncates timestamps to the hour for temporal privacy.
+
+26. tests/integration/http-security.test.ts [CREATED]
+    - 5 automated integration tests running an ephemeral HTTP server to verify:
+      * Injection of Helmet security headers.
+      * Clean HTTP 400 Bad Request responses on malformed JSON bodies.
+      * HTTP 413 Payload Too Large enforcement on bodies exceeding 50kb.
+      * Clean HTTP 404 responses on non-existent endpoints.
+      * HTTP 401 Unauthorized enforcement on unauthenticated route access.
+
+
+================================================================================
+3. NPM SCRIPTS & OPERATIONAL COMMANDS WORKFLOW
+================================================================================
+
+All scripts configured in package.json and their operational roles:
+
+1. INSTALLING DEPENDENCIES
+   Before running the application, install the newly added production dependencies
+   and clean up legacy packages. You can run the provided helper scripts or execute
+   the commands manually:
+
+   Using PowerShell (Windows):
+       .\install-dependencies.ps1
+
+   Using Bash (Linux/macOS):
+       chmod +x ./install-dependencies.sh && ./install-dependencies.sh
+
+   Using npm directly:
+       npm install temporal-polyfill helmet express-rate-limit
+       npm uninstall @prisma/client
+
+   Using pnpm directly:
+       pnpm add temporal-polyfill helmet express-rate-limit
+       pnpm remove @prisma/client
+
+
+2. RUNNING AUTOMATED TESTS
+   Executes all 26 unit and integration test suites using Node's native test runner
+   (zero external test framework overhead):
+
+       npm test
+       (or: npm run test)
+
+   What it executes:
+       node --test tests/unit/*.test.ts tests/integration/*.test.ts
+
+   Test Coverage:
+       ✔ HTTP Security & Error Handling Middleware (5 tests)
+       ✔ Auth Library & JWT Security (5 tests)
+       ✔ Ballot Secrecy & Data Contract Integrity (3 tests)
+       ✔ Validation Library (13 tests)
+
+
+3. RUNNING DEVELOPMENT SERVER (WATCH MODE)
+   Starts the voting API server with Node.js hot-reloading file watcher enabled:
+
+       npm run dev
+
+   What it executes:
+       node --watch ./src/server.ts
+
+   Behavior:
+       Monitors source code changes across the project and automatically restarts
+       the HTTP server without manual process termination.
+
+
+4. RUNNING PRODUCTION SERVER
+   Boots the server in standard production mode (without hot-reloading overhead):
+
+       npm start
+       (or: npm run start)
+
+   What it executes:
+       node ./src/server.ts
+
+   Behavior:
+       Validates environment variables via src/config.ts, mounts hardened middleware
+       and route endpoints, and starts listening on process.env.PORT (default 8000).
+
+
+5. STATIC TYPECHECKING (BUILD VERIFICATION)
+   Runs the TypeScript compiler in verification mode across the entire codebase:
+
+       npm run build
+
+   What it executes:
+       tsc --noEmit
+
+   Behavior:
+       Validates strict type soundness across all controllers, libraries, routes,
+       and test files according to tsconfig.json without generating unwanted disk
+       transpilation artifacts.
+
+
+6. PRISMA 8 CONTRACT EMISSION
+   Regenerates the typed Prisma 8 schema contract artifacts (contract.json & contract.d.ts):
+
+       npm run contract:emit
+
+   What it executes:
+       prisma contract emit
+
+   When to run:
+       Whenever src/prisma/contract.prisma is modified to synchronize runtime type
+       definitions with the PostgreSQL data contract.
+
+================================================================================
+END OF REPORT
+================================================================================

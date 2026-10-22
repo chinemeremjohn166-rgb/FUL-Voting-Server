@@ -1,0 +1,146 @@
+// use prisma-8
+
+enum Role {
+  VOTER
+  ADMIN
+}
+
+enum ElectionStatus {
+  DRAFT
+  OPEN
+  CLOSED
+  PUBLISHED
+}
+
+model User {
+  id           Uuid     @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  fullName     String
+  matricNo     String?  @unique
+  role         Role     @default(VOTER)
+  createdAt    DateTime @default(now())
+  // Set on logout. Any token issued before this instant is refused, so a
+  // sign-out survives a server restart and is shared across processes.
+  tokensRevokedAt DateTime?
+
+  ballots          Ballot[]
+  rollEntries      VoterRoll[]
+  auditLogs        AuditLog[]
+  createdElections Election[] @relation("ElectionCreator")
+
+  @@map("users")
+}
+
+model Election {
+  id          Uuid           @id @default(uuid())
+  title       String
+  description String?
+  status      ElectionStatus @default(DRAFT)
+  startsAt    DateTime
+  endsAt      DateTime
+  publishedAt DateTime?
+  createdById Uuid
+  createdAt   DateTime       @default(now())
+  updatedAt   temporal.updatedAt()
+
+  createdBy User        @relation("ElectionCreator", fields: [createdById], references: [id])
+  positions Position[]
+  roll      VoterRoll[]
+  ballots   Ballot[]
+  votes     Vote[]
+
+  @@index([status, startsAt])
+  @@map("elections")
+}
+
+model Position {
+  id         Uuid   @id @default(uuid())
+  electionId Uuid
+  title      String
+  seats      Int    @default(1)
+  order      Int    @default(0)
+
+  election   Election    @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  candidates Candidate[]
+  votes      Vote[]
+
+  @@unique([electionId, title])
+  @@index([electionId, order])
+  @@map("positions")
+}
+
+model Candidate {
+  id         Uuid    @id @default(uuid())
+  positionId Uuid
+  fullName   String
+  manifesto  String?
+  photoUrl   String?
+  order      Int     @default(0)
+
+  position Position @relation(fields: [positionId], references: [id], onDelete: Cascade)
+  votes    Vote[]
+
+  @@index([positionId, order])
+  @@map("candidates")
+}
+
+model VoterRoll {
+  id         Uuid     @id @default(uuid())
+  electionId Uuid
+  userId     Uuid
+  addedAt    DateTime @default(now())
+
+  election Election @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([electionId, userId])
+  @@map("voter_roll")
+}
+
+/// Records THAT a user voted. Never what they chose.
+model Ballot {
+  id          Uuid     @id @default(uuid())
+  electionId  Uuid
+  userId      Uuid
+  receiptCode String   @unique
+  castAt      DateTime @default(now())
+
+  election Election @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([electionId, userId])
+  @@map("ballots")
+}
+
+/// Records WHAT was chosen. Deliberately has no link to User or Ballot,
+/// and no timestamp: a castAt column would let votes be joined to ballots by time.
+model Vote {
+  id          Uuid     @id @default(uuid())
+  electionId  Uuid
+  positionId  Uuid
+  candidateId Uuid?
+
+  election  Election   @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  position  Position   @relation(fields: [positionId], references: [id], onDelete: Cascade)
+  candidate Candidate? @relation(fields: [candidateId], references: [id], onDelete: SetNull)
+
+  @@index([electionId, positionId])
+  @@index([candidateId])
+  @@map("votes")
+}
+
+model AuditLog {
+  id        Uuid     @id @default(uuid())
+  actorId   Uuid
+  action    String
+  entity    String
+  entityId  String?
+  metadata  Jsonb?
+  createdAt DateTime @default(now())
+
+  actor User @relation(fields: [actorId], references: [id])
+
+  @@index([entity, entityId])
+  @@map("audit_logs")
+}
