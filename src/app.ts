@@ -10,10 +10,22 @@ import candidateRoutes from "./routes/candidate.routes.ts";
 import voterRollRoutes from "./routes/voter-roll.routes.ts";
 import voteRoutes from "./routes/vote.routes.ts";
 import resultRoutes from "./routes/result.routes.ts";
-import { notFoundHandler, globalErrorHandler } from "./middlewares/error.middleware.ts";
+import {
+  notFoundHandler,
+  globalErrorHandler,
+} from "./middlewares/error.middleware.ts";
 import { db } from "./prisma/db.ts";
+import cors from "cors";
 
 const app: Application = express();
+
+// allow cross-origin requests (Fix M10)
+app.use(
+  cors({
+    origin: ["http://localhost:3000", "https://ful-voting.vercel.app"],
+    credentials: true,
+  }),
+);
 
 // Security headers (Fix M10)
 app.use(helmet());
@@ -28,7 +40,10 @@ const authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   skip: () => config.isTest,
-  message: { message: "Too many authentication attempts. Please try again after 15 minutes." },
+  message: {
+    message:
+      "Too many authentication attempts. Please try again after 15 minutes.",
+  },
 });
 
 const verifyLimiter = rateLimit({
@@ -37,7 +52,9 @@ const verifyLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   skip: () => config.isTest,
-  message: { message: "Too many receipt verification requests. Please try again later." },
+  message: {
+    message: "Too many receipt verification requests. Please try again later.",
+  },
 });
 
 // Route Mounts (Versioned under /api/v1)
