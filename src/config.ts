@@ -35,14 +35,24 @@ const corsOrigins = (
   .filter(Boolean);
 
 export const config = {
-  nodeEnv: NODE_ENV,
-  isProduction: NODE_ENV === "production",
-  isTest: NODE_ENV === "test",
+  get nodeEnv() {
+    return process.env.NODE_ENV ?? process.env.ENV ?? "development";
+  },
+  get isProduction() {
+    return this.nodeEnv === "production";
+  },
+  get isTest() {
+    return this.nodeEnv === "test";
+  },
   port: Number(process.env.PORT) || 8000,
   databaseUrl: required("DATABASE_URL"),
   jwtSecret: JWT_SECRET,
   jwtExpiresIn: process.env.JWT_EXPIRES_IN ?? "1d",
   resendApiKey: process.env.RESEND_API_KEY?.trim() ?? "",
   resendFromEmail: process.env.RESEND_FROM_EMAIL?.trim() || "BallotBox <onboarding@resend.dev>",
+  get emailVerification(): boolean {
+    const raw = process.env.EMAIL_VERIFICATION ?? process.env.REQUIRE_EMAIL_VERIFICATION ?? "true";
+    return raw.trim().toLowerCase() !== "false";
+  },
   corsOrigins,
 } as const;

@@ -41,6 +41,50 @@ export const registerUser = asyncHandler(async (req: Request, res: Response): Pr
   // Hash password asynchronously to not block the event loop (M1)
   const salt = await bcrypt.genSalt(10);
   const hashedPassword = await bcrypt.hash(cleanPassword, salt);
+
+  // If email verification is disabled via environment config
+  if (!config.emailVerification) {
+    if (existingEmail) {
+      throw conflict("An account with this email already exists");
+    }
+
+    const createdUser = await db.orm.public.User.create({
+      email: cleanEmail,
+      passwordHash: hashedPassword,
+      fullName,
+      matricNo: cleanMatricNo || null,
+      role: "VOTER",
+      isVerified: true,
+      verificationCode: null,
+      verificationExpiresAt: null,
+    });
+
+    const token = signToken(createdUser.id);
+
+    res.cookie("token", token, {
+      httpOnly: true,
+      secure: config.isProduction,
+      sameSite: "strict",
+      maxAge: 24 * 60 * 60 * 1000,
+    });
+
+    res.status(201).json({
+      message: "Registration successful.",
+      requiresVerification: false,
+      email: cleanEmail,
+      token,
+      user: {
+        id: createdUser.id,
+        email: createdUser.email,
+        fullName: createdUser.fullName,
+        matricNo: createdUser.matricNo,
+        role: createdUser.role,
+        isVerified: true,
+      },
+    });
+    return;
+  }
+
   const verificationCode = generateVerificationCode();
   const expiresAt = now().add({ minutes: 15 });
 
@@ -197,8 +241,8 @@ export const loginUser = asyncHandler(async (req: Request, res: Response): Promi
     throw unauthorized("Invalid credentials");
   }
 
-  // Enforce email verification for non-admin accounts
-  if (!user.isVerified && user.role !== "ADMIN") {
+  // Enforce email verification for non-admin accounts if email verification is enabled
+  if (config.emailVerification && !user.isVerified && user.role !== "ADMIN") {
     const existingExpiryMs = toEpochMs(user.verificationExpiresAt);
     const hasFreshCode =
       Boolean(user.verificationCode) &&
@@ -219,6 +263,16 @@ export const loginUser = asyncHandler(async (req: Request, res: Response): Promi
       requiresVerification: true,
       email: user.email,
     });
+  }
+
+  // If email verification is disabled but user was previously unverified, activate them
+  if (!config.emailVerification && !user.isVerified) {
+    await db.orm.public.User.where({ id: user.id }).update({
+      isVerified: true,
+      verificationCode: null,
+      verificationExpiresAt: null,
+    });
+    user = { ...user, isVerified: true };
   }
 
   const token = signToken(user.id);
